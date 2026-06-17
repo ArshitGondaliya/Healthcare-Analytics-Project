@@ -1,11 +1,13 @@
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from datetime import datetime
 from pathlib import Path
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import r2_score
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # === Page config ===
 st.set_page_config(
@@ -265,23 +267,61 @@ def main() -> None:
 
     st.markdown("---")
 
-    # Pipeline flow visualization
+    # Pipeline flow visualization (Sankey)
     st.subheader("🚦 Care Pipeline Flow Visualization")
     if selected_stages:
-        fig_flow = px.line(
-            df_filtered,
-            x="Date",
-            y=selected_stages,
-            title="Daily Care Pipeline Stage Counts",
-            labels={
-                "value": "Children count",
-                "variable": "Pipeline stage",
-            },
-        )
-        fig_flow.update_layout(height=520, legend=dict(title="Stage", orientation="h", y=-0.25))
-        st.plotly_chart(fig_flow, use_container_width=True)
+        # Define node labels and colors
+        node_labels = [
+            "Children Apprehended and Placed in CBP Custody",
+            "Children in CBP Custody",
+            "Children Transferred out of CBP Custody",
+            "Children in HHS Care",
+            "Children Discharged from HHS Care",
+        ]
+        node_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+
+        # Safely compute link values from the filtered dataset (use sums, fill NaN with 0)
+        app_sum = int(df_filtered.get("Children apprehended and placed in CBP custody*", pd.Series(dtype=float)).fillna(0).sum())
+        in_cbp_sum = int(df_filtered.get("Children in CBP custody", pd.Series(dtype=float)).fillna(0).sum())
+        transferred_sum = int(df_filtered.get("Children transferred out of CBP custody", pd.Series(dtype=float)).fillna(0).sum())
+        in_hhs_sum = int(df_filtered.get("Children in HHS Care", pd.Series(dtype=float)).fillna(0).sum())
+        discharged_sum = int(df_filtered.get("Children discharged from HHS Care", pd.Series(dtype=float)).fillna(0).sum())
+
+        # Map flows between nodes. Use the most relevant column sums for each link.
+        # Apprehended -> In CBP custody
+        src = [0, 1, 2, 3]
+        tgt = [1, 2, 3, 4]
+        values = [app_sum, transferred_sum, transferred_sum, discharged_sum]
+
+        # If there's essentially no data, display a friendly message
+        if sum(values) == 0:
+            st.info("Not enough pipeline data to render the Sankey diagram for the selected range.")
+        else:
+            link_colors = ["rgba(31,119,180,0.6)", "rgba(255,127,14,0.6)", "rgba(44,160,44,0.6)", "rgba(214,39,40,0.6)"]
+
+            sankey = go.Figure(
+                go.Sankey(
+                    arrangement="snap",
+                    node=dict(
+                        pad=20,
+                        thickness=20,
+                        line=dict(color="black", width=0.5),
+                        label=node_labels,
+                        color=node_colors,
+                    ),
+                    link=dict(
+                        source=src,
+                        target=tgt,
+                        value=values,
+                        color=link_colors,
+                        hovertemplate="%{source.label} → %{target.label}: %{value}<extra></extra>",
+                    ),
+                )
+            )
+            sankey.update_layout(title_text="Care Transition Sankey Diagram", font_size=12, height=520)
+            st.plotly_chart(sankey, use_container_width=True)
     else:
-        st.warning("Select at least one pipeline stage in the sidebar to display the flow graph.")
+        st.warning("Select at least one pipeline stage in the sidebar to display the flow diagram.")
 
     st.markdown("---")
 
@@ -445,12 +485,41 @@ def main() -> None:
             ]
         ]
         y = modeling_df["Children discharged from HHS Care"]
-        model = LinearRegression()
-        model.fit(X, y)
-        y_pred = model.predict(X)
-        r2 = r2_score(y, y_pred)
 
-        st.markdown(f"**Model R² Score:** {r2:.3f}")
+        # Train/test split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
+
+        # Train RandomForestRegressor
+        rf = RandomForestRegressor(n_estimators=200, random_state=42)
+        rf.fit(X_train, y_train)
+
+        # Evaluate on test set
+        y_pred = rf.predict(X_test)
+        mae = mean_absolute_error(y_test, y_pred)
+        # Use sqrt of MSE for RMSE to maintain compatibility with older sklearn versions
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        r2 = r2_score(y_test, y_pred)
+
+        # Display model metrics
+        st.markdown("**Model Performance (Random Forest)**")
+        mcol1, mcol2, mcol3 = st.columns(3)
+        mcol1.metric("MAE", f"{mae:,.2f}")
+        mcol2.metric("RMSE", f"{rmse:,.2f}")
+        mcol3.metric("R²", f"{r2:.3f}")
+
+        # Short interpretation
+        interpretation = (
+            "MAE is the average absolute error in predicted discharges. "
+            "Lower MAE/RMSE values indicate better predictive accuracy. "
+            f"An R² of {r2:.3f} indicates that the model explains {r2*100:.1f}% of the variance on the test set."
+        )
+        st.info(interpretation)
+
+        # Retrain on full data for interactive predictions
+        final_model = RandomForestRegressor(n_estimators=200, random_state=42)
+        final_model.fit(X, y)
 
         with st.expander("Use model inputs to forecast HHS discharges"):
             c1, c2, c3, c4 = st.columns(4)
@@ -475,14 +544,14 @@ def main() -> None:
                 value=int(df_filtered["Children in HHS Care"].median()),
             )
 
-            predicted = model.predict(
+            predicted = final_model.predict(
                 [[inp_apprehended, inp_cbp_load, inp_transfers, inp_hhs]]
             )
             st.success(
                 f"Estimated HHS discharges: {max(int(round(predicted[0])), 0):,} children"
             )
             st.markdown(
-                "This simple regression model estimates discharge volume from current custody and transfer counts. "
+                "This Random Forest model estimates discharge volume from current custody and transfer counts. "
                 "Use it to test whether future discharge outcomes keep pace with inflows."
             )
     else:
